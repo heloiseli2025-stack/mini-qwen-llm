@@ -1,0 +1,166 @@
+"""Fused QKV Projection + QK-Norm + RoPE Kernel（M2 实现）。
+
+实现策略：
+  1. QKV 投影：3 次 torch.mm（cuBLAS），不进 Triton（大 GEMM cuBLAS 更快）
+  2. QK-Norm + RoPE：1 次 Triton kernel，Q 和 K 合并在同一 grid 处理
+  3. V：直接使用 GEMM 输出，无 norm / RoPE
+
+Grid: (B*S, H_Q + H_KV)
+  pid_head 0..H_Q-1          → 处理 Q head（is_q = True）
+  pid_head H_Q..H_Q+H_KV-1  → 处理 K head（is_q = False）
+
+HBM 读写（Q/K 各）：
+  unfused：GEMM写 + norm读 + norm写 + rope读 + rope写 = 5 次
+  fused  ：GEMM写 + kernel读 + kernel写            = 3 次
+
+# === FROZEN SIGNATURE ===（M2 完成后冻结）
+# def fused_qkv_rope(
+#     x:        torch.Tensor,  # [batch, seq_len, hidden_size], bf16
+#     w_q:      torch.Tensor,  # [num_q_heads * head_dim, hidden_size], bf16
+#     w_k:      torch.Tensor,  # [num_kv_heads * head_dim, hidden_size], bf16
+#     w_v:      torch.Tensor,  # [num_kv_heads * head_dim, hidden_size], bf16
+#     q_norm_w: torch.Tensor,  # [head_dim], bf16
+#     k_norm_w: torch.Tensor,  # [head_dim], bf16
+#     cos:      torch.Tensor,  # [seq_len, head_dim], bf16
+#     sin:      torch.Tensor,  # [seq_len, head_dim], bf16
+# ) -> Tuple[Tensor, Tensor, Tensor]  # q [B,S,H_q,D], k [B,S,H_kv,D], v [B,S,H_kv,D], bf16
+"""
+from __future__ import annotations
+
+from typing import Tuple
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _qk_norm_rope_kernel(
+    # ── 输入 ──────────────────────────────────────────────────────
+    Q,          # [total_tokens, H_Q, D]  raw GEMM output，bf16
+    K,          # [total_tokens, H_KV, D] raw GEMM output，bf16
+    # ── 输出 ──────────────────────────────────────────────────────
+    Q_out,      # [total_tokens, H_Q, D]  bf16
+    K_out,      # [total_tokens, H_KV, D] bf16
+    # ── Norm 权重 ─────────────────────────────────────────────────
+    q_norm_w,   # [D] bf16
+    k_norm_w,   # [D] bf16
+    # ── RoPE 表 ───────────────────────────────────────────────────
+    cos,        # [S, D] bf16
+    sin,        # [S, D] bf16
+    # ── 运行时标量 ────────────────────────────────────────────────
+    S,          # seq_len，用于 seq_pos = pid_tok % S
+    H_Q,        # Q head 数，用于区分 Q/K 分支
+    stride_qt,  # Q 的 token stride = H_Q * D
+    stride_kt,  # K 的 token stride = H_KV * D
+    # ── 编译时常量 ────────────────────────────────────────────────
+    D:      tl.constexpr,   # head_dim（128）
+    HALF_D: tl.constexpr,   # head_dim // 2（64）
+    EPS:    tl.constexpr,   # RMSNorm eps（1e-6）
+):
+    pid_tok  = tl.program_id(0)   # 0 .. B*S - 1
+    pid_head = tl.program_id(1)   # 0 .. H_Q+H_KV - 1
+
+    is_q = pid_head < H_Q
+
+    # K head 索引：Q 分支用 0（占位，不实际访问）
+    k_head = tl.where(is_q, 0, pid_head - H_Q)
+
+    d0 = tl.arange(0, HALF_D)   # [HALF_D]
+
+    # ── 加载输入（分两半，强制 fp32 累加）────────────────────────
+    if is_q:
+        base = Q + pid_tok * stride_qt + pid_head * D
+        x1 = tl.load(base + d0        ).to(tl.float32)
+        x2 = tl.load(base + HALF_D + d0).to(tl.float32)
+        w1 = tl.load(q_norm_w + d0        ).to(tl.float32)
+        w2 = tl.load(q_norm_w + HALF_D + d0).to(tl.float32)
+    else:
+        base = K + pid_tok * stride_kt + k_head * D
+        x1 = tl.load(base + d0        ).to(tl.float32)
+        x2 = tl.load(base + HALF_D + d0).to(tl.float32)
+        w1 = tl.load(k_norm_w + d0        ).to(tl.float32)
+        w2 = tl.load(k_norm_w + HALF_D + d0).to(tl.float32)
+
+    # ── RMSNorm（per-head，fp32 累加，防止 bf16 精度损失）─────────
+    rms = tl.rsqrt((tl.sum(x1 * x1) + tl.sum(x2 * x2)) / D + EPS)
+    x1_n = x1 * rms * w1
+    x2_n = x2 * rms * w2
+
+    # ── RoPE ─────────────────────────────────────────────────────
+    # rotate_half([x1, x2]) = [-x2, x1]
+    # out[:HALF_D] = x1 * cos[:HALF_D] - x2 * sin[:HALF_D]
+    # out[HALF_D:] = x2 * cos[HALF_D:] + x1 * sin[HALF_D:]
+    seq_pos = pid_tok % S
+    cos_base = cos + seq_pos * D
+    sin_base = sin + seq_pos * D
+    cos1 = tl.load(cos_base + d0        ).to(tl.float32)
+    cos2 = tl.load(cos_base + HALF_D + d0).to(tl.float32)
+    sin1 = tl.load(sin_base + d0        ).to(tl.float32)
+    sin2 = tl.load(sin_base + HALF_D + d0).to(tl.float32)
+
+    out1 = (x1_n * cos1 - x2_n * sin1).to(tl.bfloat16)
+    out2 = (x2_n * cos2 + x1_n * sin2).to(tl.bfloat16)
+
+    # ── 写回 ──────────────────────────────────────────────────────
+    if is_q:
+        o_base = Q_out + pid_tok * stride_qt + pid_head * D
+    else:
+        o_base = K_out + pid_tok * stride_kt + k_head * D
+
+    tl.store(o_base + d0        , out1)
+    tl.store(o_base + HALF_D + d0, out2)
+
+
+def fused_qkv_rope(
+    x:        torch.Tensor,   # [B, S, hidden_size], bf16
+    w_q:      torch.Tensor,   # [H_Q * D, hidden_size], bf16
+    w_k:      torch.Tensor,   # [H_KV * D, hidden_size], bf16
+    w_v:      torch.Tensor,   # [H_KV * D, hidden_size], bf16
+    q_norm_w: torch.Tensor,   # [D], bf16
+    k_norm_w: torch.Tensor,   # [D], bf16
+    cos:      torch.Tensor,   # [S, D], bf16
+    sin:      torch.Tensor,   # [S, D], bf16
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """融合 QKV 投影 + QK-Norm + RoPE。
+
+    返回 (q, k, v)，shape 均为 [B, S, H_heads, D]，dtype bf16。
+    - q: [B, S, H_Q, D]
+    - k: [B, S, H_KV, D]
+    - v: [B, S, H_KV, D]  直接来自 GEMM，无 norm/rope
+    """
+    B, S, H = x.shape
+    D    = q_norm_w.shape[0]
+    H_Q  = w_q.shape[0] // D
+    H_KV = w_k.shape[0] // D
+
+    assert D % 2 == 0, "head_dim 必须是偶数（RoPE rotate_half）"
+    HALF_D = D // 2
+
+    x_2d = x.reshape(B * S, H)
+
+    # ① 三次 cuBLAS GEMM（各 1 个 kernel launch）
+    q = (x_2d @ w_q.T).view(B * S, H_Q,  D)
+    k = (x_2d @ w_k.T).view(B * S, H_KV, D)
+    v = (x_2d @ w_v.T).view(B * S, H_KV, D)
+
+    # ② 融合 QK-Norm + RoPE（1 个 Triton kernel launch）
+    q_out = torch.empty_like(q)
+    k_out = torch.empty_like(k)
+
+    grid = (B * S, H_Q + H_KV)
+    _qk_norm_rope_kernel[grid](
+        q, k, q_out, k_out,
+        q_norm_w, k_norm_w,
+        cos, sin,
+        S, H_Q,
+        q.stride(0),   # stride_qt = H_Q * D
+        k.stride(0),   # stride_kt = H_KV * D
+        D=D, HALF_D=HALF_D, EPS=1e-6,
+    )
+
+    return (
+        q_out.view(B, S, H_Q,  D),
+        k_out.view(B, S, H_KV, D),
+        v.view(B, S, H_KV, D),
+    )

@@ -1,0 +1,41 @@
+[project]
+name = "mini-qwen-llm"
+version = "0.1.0"
+description = "高性能 Qwen3 推理与算子优化引擎"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "torch>=2.4.0",
+    "triton>=3.0.0",
+    "transformers>=4.51.0",
+    "safetensors>=0.4.0",
+    "numpy",
+    "tqdm",
+    "datasets",
+    "fastapi",
+    "uvicorn",
+    "huggingface-hub",
+]
+
+[project.optional-dependencies]
+bench = [
+    "vllm",
+    "matplotlib",
+    "pandas",
+]
+dev = [
+    "pytest",
+    "pytest-benchmark",
+    "ruff",
+    "ipython",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

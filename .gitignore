@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+.env
+
+# 模型权重（不要 commit）
+weights/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Benchmark 产出
+docs/benchmarks/*.nsys-rep
+docs/benchmarks/*.png
+
+# Misc
+.DS_Store
+*.log
+.ipynb_checkpoints/

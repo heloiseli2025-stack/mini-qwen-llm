@@ -219,7 +219,7 @@ mini-qwen-llm/
 │   └── quantization/
 │       ├── awq.py                   # AWQ quantization algorithm
 │       └── packing.py               # int4 pack/unpack utilities
-├── tests/                           # 60 tests, covering all kernels + scheduler
+├── tests/                           # 37 tests, covering all kernels + scheduler
 ├── benchmarks/                      # bench_attention, bench_w4a16, bench_moe, bench_throughput
 ├── scripts/                         # download_model, run_inference, compare_with_hf
 └── docs/
@@ -252,6 +252,7 @@ GQA configuration: Qwen3-8B → 32 Q heads / 8 KV heads (4:1), head_dim=128. Qwe
 - No prefix caching or speculative decoding.
 - W4A16 kernel is tuned for decode (small M); prefill (large M) still uses BF16.
 - W4A16 decode uses an unfused QKV + RoPE fallback (fused kernel requires raw fp16 weights unavailable in `LinearW4A16`). BF16 decode uses the fused kernel with per-sequence position indices.
+- `kernels/rms_norm.py` and `kernels/swiglu_mlp.py` are stub files (`raise NotImplementedError`). The model uses `nn.Linear`-based SwiGLU and the PyTorch RMSNorm implementation; fused Triton versions of these two are not yet implemented.
 
 ---
 

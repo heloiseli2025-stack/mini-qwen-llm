@@ -32,8 +32,9 @@ def _bench_mini_qwen(model_path, batch_size, prompt_len, gen_len,
     from mini_qwen.engine.scheduler import Scheduler
     from mini_qwen.model.loader import load_moe_from_gptq
 
-    model, cfg = load_moe_from_gptq(model_path, device=device)
+    model = load_moe_from_gptq(model_path, device=device)
     model.eval()
+    cfg = model.config
 
     num_blocks = 2048
     kv_cfg = KVCacheConfig(
@@ -84,7 +85,6 @@ def _bench_vllm(model_path, batch_size, prompt_len, gen_len, warmup, measure):
 
     llm = LLM(
         model=model_path,
-        quantization="gptq",
         dtype="float16",
         max_model_len=prompt_len + gen_len + 64,
         gpu_memory_utilization=0.85,
@@ -137,12 +137,14 @@ def main():
     print(header)
     print("-" * len(header))
 
+    results = []
     for bs in args.batch:
         print(f"  batch={bs}: running mini-qwen-llm ...", flush=True)
         mq_tps = _bench_mini_qwen(
             args.model_path, bs, args.prompt_len, args.gen_len,
             args.warmup, args.measure, device,
         )
+        print(f"    mini-qwen batch={bs}: {mq_tps:.1f} tok/s", flush=True)
 
         vllm_tps = None
         if not args.skip_vllm:
@@ -151,7 +153,12 @@ def main():
                 args.model_path, bs, args.prompt_len, args.gen_len,
                 args.warmup, args.measure,
             )
+        results.append((bs, mq_tps, vllm_tps))
 
+    print()
+    print(header)
+    print("-" * len(header))
+    for bs, mq_tps, vllm_tps in results:
         if vllm_tps is not None:
             ratio = mq_tps / vllm_tps
             print(f"{bs:>6}  {mq_tps:>20.1f}  {vllm_tps:>14.1f}  {ratio:>8.2f}x")

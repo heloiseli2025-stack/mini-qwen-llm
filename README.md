@@ -55,6 +55,20 @@ Qwen3-30B-A3B (128 experts, top-8, 48 layers) loaded from GPTQ checkpoint:
 - 48 router gates excluded from quantization (dequantized to fp16)
 - Top-1 token match verified correct vs. BF16 reference
 
+### M5 — End-to-End Throughput (Qwen3-30B-A3B-GPTQ-Int4, A800 80GB)
+
+Continuous batching scheduler + W4A16 paged inference (prompt_len=512, gen_len=64, warmup=2, measure=5):
+
+| Batch | Throughput (tok/s) |
+|------:|-------------------:|
+| 1     | 3.1                |
+| 8     | 16.4               |
+| 16    | 16.2               |
+
+batch=8→16 saturation is expected: W4A16 decode is memory-bandwidth bound; at batch=8 the A800's 2 TB/s HBM is already close to saturated loading 30B parameters per token.
+
+Note: vLLM comparison is blocked by checkpoint key name incompatibility between this GPTQ format and vLLM 0.21.0 (`w2_g_idx` key missing).
+
 ---
 
 ## Architecture
@@ -95,7 +109,7 @@ Qwen3-30B-A3B (128 experts, top-8, 48 layers) loaded from GPTQ checkpoint:
 
 **Continuous Batching** — Scheduler runs one step type per iteration: decode (if sequences are running) or prefill (otherwise). Block pre-allocation happens inside `Scheduler.step()` before returning the decode batch, so `ModelRunner.run_decode()` never touches the block manager mid-inference.
 
-**Decode RoPE** — The fused QKV kernel uses `seq_pos = pid_tok % S`, which is only valid when all sequences have the same length. For decode (mixed lengths), the decode path bypasses the fused kernel: unfused QKV projections + QK-Norm + per-sequence RoPE indexed directly from the precomputed `cos_cached / sin_cached` buffers.
+**Decode RoPE** — The fused QKV kernel supports two RoPE position modes: prefill uses `seq_pos = pid_tok % S` (uniform per batch); decode passes an explicit `positions` tensor so each sequence gets its correct `cos_cached[seq_len - 1]` row. BF16 models use the fused path for both modes. W4A16 models use unfused projections + per-sequence RoPE (the fused kernel requires raw fp16 weight tensors, which `LinearW4A16` doesn't expose).
 
 ---
 
@@ -237,7 +251,7 @@ GQA configuration: Qwen3-8B → 32 Q heads / 8 KV heads (4:1), head_dim=128. Qwe
 - No preemption — if KV blocks run out, new requests wait in queue.
 - No prefix caching or speculative decoding.
 - W4A16 kernel is tuned for decode (small M); prefill (large M) still uses BF16.
-- Fused QKV kernel assumes uniform sequence length within a batch. Decode path uses an unfused fallback for per-sequence RoPE positions.
+- W4A16 decode uses an unfused QKV + RoPE fallback (fused kernel requires raw fp16 weights unavailable in `LinearW4A16`). BF16 decode uses the fused kernel with per-sequence position indices.
 
 ---
 

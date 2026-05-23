@@ -64,10 +64,10 @@ def _make_toy_model_and_caches(device: torch.device):
 def _make_real_model_and_caches(model_path: str, device: torch.device):
     """Load a real GPTQ checkpoint."""
     from mini_qwen.model.loader import load_moe_from_gptq
-    from mini_qwen.config import Qwen3MoEConfig
 
-    model, cfg = load_moe_from_gptq(model_path, device=device)
+    model = load_moe_from_gptq(model_path, device=device)
     model.eval()
+    cfg = model.config
     num_blocks = 2048
     kv_cfg = KVCacheConfig(
         num_blocks=num_blocks,

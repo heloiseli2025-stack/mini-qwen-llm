@@ -172,8 +172,8 @@ def fused_qkv_rope(
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
 
-    # pass a dummy pointer when positions unused (Triton requires a valid ptr)
-    pos_ptr = positions if use_positions else q.view(-1)
+    # Triton requires a valid pointer even for unused arguments; use a typed 1-element buffer
+    pos_ptr = positions if use_positions else torch.empty(1, dtype=torch.int32, device=x.device)
 
     grid = (B * S, H_Q + H_KV)
     _qk_norm_rope_kernel[grid](

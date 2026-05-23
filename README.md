@@ -67,7 +67,7 @@ Continuous batching scheduler + W4A16 paged inference (prompt_len=512, gen_len=6
 
 batch=8→16 saturation is expected: W4A16 decode is memory-bandwidth bound; at batch=8 the A800's 2 TB/s HBM is already close to saturated loading 30B parameters per token.
 
-Note: vLLM comparison is blocked by checkpoint key name incompatibility between this GPTQ format and vLLM 0.21.0 (`w2_g_idx` key missing).
+vLLM numbers are not included: this engine uses a `zero_plus_one=True` GPTQ packing convention that differs from vLLM's expected key names (`w2_g_idx` vs `g_idx`), making a direct drop-in comparison require a weight conversion step. The throughput numbers above are standalone measurements of this engine on the same hardware.
 
 ---
 

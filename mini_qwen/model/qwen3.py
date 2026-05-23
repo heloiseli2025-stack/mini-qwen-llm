@@ -1,6 +1,6 @@
-"""Qwen3 Dense 推理模型（纯 PyTorch，M0 基线）。
+"""Qwen3 Dense inference model (pure PyTorch, M0 baseline).
 
-模块命名与 HuggingFace Qwen3ForCausalLM 保持一致，方便直接 load_state_dict。
+Module names match HuggingFace Qwen3ForCausalLM for direct load_state_dict compatibility.
 """
 from __future__ import annotations
 from typing import TYPE_CHECKING
@@ -104,7 +104,7 @@ class Qwen3ForCausalLM(nn.Module):
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """返回 logits，shape [batch, seq_len, vocab_size]。"""
+        """Return logits with shape [batch, seq_len, vocab_size]."""
         hidden_states = self.model(input_ids)
         return self.lm_head(hidden_states)
 
@@ -116,7 +116,7 @@ class Qwen3ForCausalLM(nn.Module):
         temperature: float = 1.0,
         do_sample: bool = False,
     ) -> torch.Tensor:
-        """贪心或采样解码，用于 M0 功能验证。"""
+        """Greedy or sampling decode, used for M0 functional verification."""
         generated = input_ids.clone()
         for _ in range(max_new_tokens):
             logits = self(generated)[:, -1, :]  # [B, vocab]
@@ -134,7 +134,7 @@ class Qwen3ForCausalLM(nn.Module):
         kv_caches: "list[KVCache]",
         block_table: torch.Tensor,     # [1, max_blocks] int32
     ) -> torch.Tensor:                 # [1, S, vocab_size]
-        """单条序列 prefill，写入 KV cache，返回全序列 logits。"""
+        """Prefill a single sequence, write to KV cache, and return full-sequence logits."""
         S = input_ids.shape[1]
         hidden = self.model.embed_tokens(input_ids)
         cos, sin = self.model.rotary_emb(S)
@@ -155,9 +155,9 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids: torch.Tensor,       # [B]
         kv_caches: "list[KVCache]",
         block_table: torch.Tensor,     # [B, max_blocks] int32
-        seq_lens_new: torch.Tensor,    # [B] int32，含新 token 的总长
+        seq_lens_new: torch.Tensor,    # [B] int32, total length including the new token
     ) -> torch.Tensor:                 # [B, vocab_size]
-        """批量 decode 一步，返回各序列 next-token logits。"""
+        """Decode one step for a batch, returning next-token logits for each sequence."""
         B = input_ids.shape[0]
         hidden = self.model.embed_tokens(input_ids.unsqueeze(1))   # [B, 1, H]
         positions = (seq_lens_new - 1).to(torch.long)

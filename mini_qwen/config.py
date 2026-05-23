@@ -19,7 +19,7 @@ class Qwen3Config:
 
     @classmethod
     def from_hf_config(cls, hf_config) -> "Qwen3Config":
-        # transformers 4.51+ 把 rope_theta 放进了 rope_parameters / rope_scaling 字典
+        # transformers 4.51+ moved rope_theta into the rope_parameters / rope_scaling dict
         rope_params = getattr(hf_config, "rope_parameters", None) or getattr(
             hf_config, "rope_scaling", {}
         )
@@ -49,15 +49,15 @@ class Qwen3Config:
 
 @dataclass
 class Qwen3MoEConfig(Qwen3Config):
-    """Qwen3 MoE 扩展配置（Qwen3-30B-A3B 等）。"""
+    """Qwen3 MoE extended config (Qwen3-30B-A3B, etc.)."""
     num_experts: int = 128
     num_experts_per_tok: int = 8
-    norm_topk_prob: bool = True   # Qwen3-30B-A3B 默认 True：topk weights 除以其 sum 归一化
+    norm_topk_prob: bool = True   # Qwen3-30B-A3B default True: normalize topk weights by their sum
 
     @classmethod
     def from_hf_config(cls, hf_config) -> "Qwen3MoEConfig":
         base = Qwen3Config.from_hf_config(hf_config)
-        # MoE 模型用 moe_intermediate_size（per-expert），而非 intermediate_size（dense FFN）
+        # MoE models use moe_intermediate_size (per-expert), not intermediate_size (dense FFN)
         moe_intermediate = getattr(hf_config, "moe_intermediate_size", None)
         if moe_intermediate is not None:
             base.intermediate_size = moe_intermediate

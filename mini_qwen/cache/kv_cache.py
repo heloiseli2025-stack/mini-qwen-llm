@@ -1,8 +1,8 @@
-"""KV Cache 物理存储。
+"""KV Cache physical storage.
 
-§3.5.1 冻结接口——KVCacheConfig 字段严禁擅自修改。
-layout: K/V cache 均为 [num_blocks, block_size, num_kv_heads, head_dim]
-block_size 内的 tokens 连续存放（保证 decode kernel 访存效率）。
+§3.5.1 Frozen interface — fields of KVCacheConfig must not be modified without approval.
+layout: Both K/V caches have shape [num_blocks, block_size, num_kv_heads, head_dim]
+Tokens within a block are stored contiguously (ensures decode kernel memory access efficiency).
 """
 from __future__ import annotations
 
@@ -13,14 +13,14 @@ import torch
 @dataclass(frozen=True)
 class KVCacheConfig:
     num_blocks: int
-    block_size: int = 16        # 固定 16，不要改（§3.5.1 冻结）
+    block_size: int = 16        # Fixed at 16, do not change (§3.5.1 frozen)
     num_kv_heads: int = 8
-    head_dim: int = 128   # Qwen3-0.6B/8B 实测值（M0 验证后修正）
+    head_dim: int = 128   # Empirical value for Qwen3-0.6B/8B (corrected after M0 validation)
     dtype: torch.dtype = torch.bfloat16
 
 
 class KVCache:
-    """单层的物理 KV Cache。M1 阶段实现 PagedAttention 写入/读取逻辑。"""
+    """Physical KV Cache for a single layer. PagedAttention read/write logic implemented in M1."""
 
     def __init__(self, config: KVCacheConfig):
         self.config = config

@@ -1,23 +1,23 @@
-"""Int4 Packing / Unpacking 工具（M3.1 实现）。
+"""Int4 Packing / Unpacking utilities (M3.1 implementation).
 
-约定（pack 和 unpack 必须一致，否则 silent error）：
+Convention (pack and unpack must be consistent, otherwise silent errors):
   packed[i] = w[8i+0] | w[8i+1]<<4 | ... | w[8i+7]<<28
-  nibble 0 = 最低 4 bit = 最低 K index（little-endian nibble 顺序）
+  nibble 0 = lowest 4 bits = lowest K index (little-endian nibble order)
 """
 import torch
 from torch import Tensor
 
 
 def pack_int4(x: Tensor) -> Tensor:
-    """将 int4 tensor 打包为 int32（8 个 int4 → 1 个 int32）。
+    """Pack an int4 tensor into int32 (8 int4 values -> 1 int32).
 
     Args:
-        x: [..., K] int32，值域 0~15（uint4）
+        x: [..., K] int32, values in range 0~15 (uint4)
 
     Returns:
         [..., K//8] int32
     """
-    assert x.shape[-1] % 8 == 0, f"最后一维必须是 8 的倍数，got {x.shape[-1]}"
+    assert x.shape[-1] % 8 == 0, f"Last dimension must be a multiple of 8, got {x.shape[-1]}"
     x = x.reshape(*x.shape[:-1], -1, 8).to(torch.int32)
     shifts = torch.tensor([0, 4, 8, 12, 16, 20, 24, 28],
                           dtype=torch.int32, device=x.device)
@@ -25,13 +25,13 @@ def pack_int4(x: Tensor) -> Tensor:
 
 
 def unpack_int4(packed: Tensor) -> Tensor:
-    """将 int32 解包为 int4 tensor。方向与 pack_int4 完全一致。
+    """Unpack int32 to an int4 tensor. Direction is exactly consistent with pack_int4.
 
     Args:
         packed: [..., K//8] int32
 
     Returns:
-        [..., K] int32，值域 0~15（uint4）
+        [..., K] int32, values in range 0~15 (uint4)
     """
     shifts = torch.tensor([0, 4, 8, 12, 16, 20, 24, 28],
                           dtype=torch.int32, device=packed.device)

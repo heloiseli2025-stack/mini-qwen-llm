@@ -9,9 +9,9 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 与 HF 保持一致：fp32 归一化，cast 回原 dtype 后再乘 weight
-        # 注意：先 cast 再乘 weight（BF16×BF16），而非全程 fp32 最后 cast
-        # 全程 fp32 方案会与 HF 在 BF16 下产生 1 ULP 差异，经过多层放大后导致路由不同
+        # Match HF behavior: normalize in fp32, cast back to original dtype, then multiply by weight
+        # Note: cast first then multiply weight (BF16 x BF16), rather than keeping full fp32 and casting at the end
+        # The all-fp32 approach produces a 1-ULP difference vs HF in BF16, which amplifies across layers and causes routing divergence
         input_dtype = x.dtype
         x_fp32 = x.float()
         rms = torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)

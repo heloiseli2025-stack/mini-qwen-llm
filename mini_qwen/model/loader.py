@@ -1,4 +1,4 @@
-"""从 HuggingFace checkpoint 加载权重到 mini_qwen 模型。"""
+"""Load weights from a HuggingFace checkpoint into the mini_qwen model."""
 from __future__ import annotations
 
 import torch
@@ -13,23 +13,23 @@ def load_moe_from_hf(
     quantize_w4a16: bool = False,
     group_size: int = 128,
 ):
-    """从 HF checkpoint 构建并加载 Qwen3MoEForCausalLM。
+    """Build and load Qwen3MoEForCausalLM from an HF checkpoint.
 
     Args:
-        model_name_or_path: HF 模型名或本地路径
-        dtype:              加载权重的 dtype（默认 bfloat16）
-        quantize_w4a16:     True → 加载后对所有 expert 做 W4A16 量化
-                            （Qwen3-30B-A3B BF16 需 60GB，4090 必须量化）
-        group_size:         W4A16 量化 group size
+        model_name_or_path: HF model name or local path
+        dtype:              dtype for loading weights (default bfloat16)
+        quantize_w4a16:     True -> apply W4A16 quantization to all experts after loading
+                            (Qwen3-30B-A3B BF16 requires ~60GB; quantization is required for 4090)
+        group_size:         W4A16 quantization group size
 
     Returns:
-        Qwen3MoEForCausalLM（已加载权重，可选已量化）
+        Qwen3MoEForCausalLM (weights loaded, optionally quantized)
 
-    内存策略（解决 120GB cgroup 限制）：
-      1. meta device 创建零内存骨架
-      2. 加载 HF 权重（~58GB BF16）
-      3. assign=True 直接接管 HF 张量，无拷贝
-      全程峰值 ~58GB，远低于 float32 空模型的 ~116GB。
+    Memory strategy (to work within a 120GB cgroup limit):
+      1. Create a zero-memory skeleton on meta device
+      2. Load HF weights (~58GB BF16)
+      3. assign=True takes over HF tensors directly, no copy
+      Peak memory ~58GB throughout, far below ~116GB for a float32 empty model.
     """
     import gc
     from transformers import AutoConfig, AutoModelForCausalLM
@@ -39,16 +39,16 @@ def load_moe_from_hf(
     hf_config = AutoConfig.from_pretrained(model_name_or_path)
     our_config = Qwen3MoEConfig.from_hf_config(hf_config)
 
-    # Step 1：用 meta device 创建骨架，获取所有期望 key 及形状，零内存开销
-    # 必须用 state_dict().keys() 而非 named_parameters()，后者会跳过 tied weight 别名
+    # Step 1: Create skeleton on meta device to get all expected keys and shapes at zero memory cost
+    # Must use state_dict().keys() instead of named_parameters(), which skips tied weight aliases
     with torch.device("meta"):
         meta_model = Qwen3MoEForCausalLM(our_config)
-    meta_sd  = meta_model.state_dict()   # 包含所有 key，含 tied weight 别名
+    meta_sd  = meta_model.state_dict()   # Contains all keys, including tied weight aliases
     our_keys = set(meta_sd.keys())
     del meta_model
 
-    # Step 2：加载 HF 权重（~58GB BF16）
-    print(f"从 {model_name_or_path} 加载 MoE 权重...", flush=True)
+    # Step 2: Load HF weights (~58GB BF16)
+    print(f"Loading MoE weights from {model_name_or_path}...", flush=True)
     hf_model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=dtype)
     hf_state  = hf_model.state_dict()
     del hf_model
@@ -56,10 +56,10 @@ def load_moe_from_hf(
 
     matched = {k: hf_state[k] for k in our_keys if k in hf_state}
 
-    # HF Qwen3MoE 将所有 expert 的权重打包成批量张量：
-    #   experts.gate_up_proj  [E, 2*D, H]  （fused gate + up）
+    # HF Qwen3MoE packs all expert weights into batched tensors:
+    #   experts.gate_up_proj  [E, 2*D, H]  (fused gate + up)
     #   experts.down_proj     [E, H, D]
-    # 需要拆分成每个 expert 的单独 Linear：experts.{e}.gate_proj.weight 等。
+    # We need to split them into per-expert Linears: experts.{e}.gate_proj.weight, etc.
     moe_int = our_config.intermediate_size   # D = 768
     for layer_idx in range(our_config.num_hidden_layers):
         prefix = f"model.layers.{layer_idx}.mlp.experts"
@@ -83,7 +83,7 @@ def load_moe_from_hf(
         for i in range(our_config.num_hidden_layers)
     }
 
-    # Step 3：缺失 key 用空张量填充（极少数，e.g. tied weight 别名）
+    # Step 3: Fill missing keys with empty tensors (rare cases, e.g. tied weight aliases)
     for k in missing:
         t = meta_sd[k]
         matched[k] = torch.empty(t.shape, dtype=t.dtype if t.dtype != torch.float32 else dtype)
@@ -93,20 +93,20 @@ def load_moe_from_hf(
     gc.collect()
 
     if missing:
-        print(f"⚠  缺少权重（随机初始化）: {sorted(missing)[:5]}{'...' if len(missing) > 5 else ''}")
+        print(f"⚠  Missing weights (randomly initialized): {sorted(missing)[:5]}{'...' if len(missing) > 5 else ''}")
     if extra:
-        print(f"   忽略 HF 多余 key: {sorted(extra)[:5]}{'...' if len(extra) > 5 else ''}")
+        print(f"   Ignoring extra HF keys: {sorted(extra)[:5]}{'...' if len(extra) > 5 else ''}")
 
-    # Step 4：重新构建真实模型（meta device），assign=True 直接接管张量，无拷贝
+    # Step 4: Rebuild the real model (meta device), assign=True takes over tensors directly with no copy
     with torch.device("meta"):
         our_model = Qwen3MoEForCausalLM(our_config)
     our_model.load_state_dict(matched, strict=True, assign=True)
     del matched
     gc.collect()
-    print(f"✓  加载完成，匹配 {len(our_keys) - len(missing)}/{len(our_keys)} 个张量", flush=True)
+    print(f"✓  Load complete, matched {len(our_keys) - len(missing)}/{len(our_keys)} tensors", flush=True)
 
-    # Step 5：非持久化 buffer（inv_freq / cos_cached / sin_cached）不在 state_dict 里，
-    #         meta device 后仍为 meta tensor，调用 .to() 时会 crash。重新计算。
+    # Step 5: Non-persistent buffers (inv_freq / cos_cached / sin_cached) are not in state_dict;
+    #         after meta device they remain meta tensors and will crash on .to(). Recompute them.
     from mini_qwen.model.layers.rope import RotaryEmbedding
     inv_freq_cpu = 1.0 / (
         our_config.rope_theta
@@ -118,9 +118,9 @@ def load_moe_from_hf(
             module._build_cache(our_config.max_position_embeddings)
 
     if quantize_w4a16:
-        print(f"量化 expert 权重为 W4A16（group_size={group_size}）...", flush=True)
+        print(f"Quantizing expert weights to W4A16 (group_size={group_size})...", flush=True)
         our_model.quantize_experts_to_w4a16(group_size=group_size)
-        print("✓  量化完成", flush=True)
+        print("✓  Quantization complete", flush=True)
 
     return our_model
 
@@ -129,11 +129,11 @@ def load_from_hf(
     model_name_or_path: str,
     dtype: torch.dtype = torch.float32,
 ) -> Qwen3ForCausalLM:
-    """从 HF checkpoint 构建并加载 Qwen3ForCausalLM。
+    """Build and load Qwen3ForCausalLM from an HF checkpoint.
 
-    策略：先加载 HF 模型拿到 state_dict，再按 key 名映射到我们的模型。
-    由于模块命名与 HF 保持一致，绝大多数 key 直接对应。
-    HF 多余的 key（如 rotary_emb.inv_freq）被静默忽略。
+    Strategy: load the HF model to obtain its state_dict, then map keys to our model.
+    Since module names match HF, the vast majority of keys correspond directly.
+    Extra HF keys (e.g. rotary_emb.inv_freq) are silently ignored.
     """
     from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -142,23 +142,23 @@ def load_from_hf(
     our_model = Qwen3ForCausalLM(our_config)
     our_keys = set(our_model.state_dict().keys())
 
-    print(f"从 {model_name_or_path} 加载权重...")
+    print(f"Loading weights from {model_name_or_path}...")
     hf_model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=dtype)
     hf_state = hf_model.state_dict()
-    del hf_model  # 立即释放显存/内存
+    del hf_model  # Immediately free GPU/CPU memory
 
     matched = {k: v for k, v in hf_state.items() if k in our_keys}
     missing = our_keys - set(matched.keys())
     extra = set(hf_state.keys()) - our_keys
 
     if missing:
-        print(f"⚠  缺少权重（保持随机初始化）: {sorted(missing)}")
+        print(f"⚠  Missing weights (kept randomly initialized): {sorted(missing)}")
     if extra:
         shown = sorted(extra)[:5]
-        print(f"   忽略 HF 多余 key: {shown}{'...' if len(extra) > 5 else ''}")
+        print(f"   Ignoring extra HF keys: {shown}{'...' if len(extra) > 5 else ''}")
 
     our_model.load_state_dict(matched, strict=False)
-    print(f"✓  加载完成，匹配 {len(matched)}/{len(our_keys)} 个张量")
+    print(f"✓  Load complete, matched {len(matched)}/{len(our_keys)} tensors")
 
     return our_model.to(dtype=dtype)
 
@@ -169,16 +169,16 @@ def load_moe_from_gptq(
     zero_plus_one: bool = True,
     device: str = "cuda",
 ):
-    """加载 GPTQ-Int4 checkpoint 到 Qwen3MoEForCausalLM（仅 CUDA）。
+    """Load a GPTQ-Int4 checkpoint into Qwen3MoEForCausalLM (CUDA only).
 
-    GPTQ（checkpoint_format=gptq, desc_act=false）量化了所有 attention 投影
-    (q/k/v/o_proj) 与 expert 投影 (gate/up/down_proj)；router(mlp.gate)/各 norm/
-    embed/lm_head 保持 fp16。所有量化 Linear 替换为 LinearW4A16。
+    GPTQ (checkpoint_format=gptq, desc_act=false) quantizes all attention projections
+    (q/k/v/o_proj) and expert projections (gate/up/down_proj); router (mlp.gate), norms,
+    embed, and lm_head remain in fp16. All quantized Linears are replaced with LinearW4A16.
 
     Args:
-        gptq_path:     GPTQ checkpoint 目录
-        zero_plus_one: GPTQ v1 的 zero-point +1 修正（见 LinearW4A16.from_gptq）
-        device:        运行设备（W4A16 kernel 仅支持 cuda）
+        gptq_path:     GPTQ checkpoint directory
+        zero_plus_one: GPTQ v1 zero-point +1 correction (see LinearW4A16.from_gptq)
+        device:        Target device (W4A16 kernel only supports cuda)
     """
     import os, json, gc
     import torch.nn as nn
@@ -195,8 +195,8 @@ def load_moe_from_gptq(
     with torch.device("meta"):
         model = Qwen3MoEForCausalLM(our_config)
 
-    # 加载全部 GPTQ 张量到 CPU
-    print(f"从 {gptq_path} 加载 GPTQ 张量...", flush=True)
+    # Load all GPTQ tensors to CPU
+    print(f"Loading GPTQ tensors from {gptq_path}...", flush=True)
     with open(os.path.join(gptq_path, "model.safetensors.index.json")) as f:
         weight_map = json.load(f)["weight_map"]
     sd = {}
@@ -205,18 +205,18 @@ def load_moe_from_gptq(
             for k in f.keys():
                 sd[k] = f.get_tensor(k)
 
-    # 哪些 Linear 被量化（含 .qweight）
+    # Which Linears are quantized (contain .qweight)
     quant_names = {k[: -len(".qweight")] for k in sd if k.endswith(".qweight")}
 
-    # MoE router (mlp.gate) 也被 GPTQ 量化了，但 router 需 fp16 精度且 moe_router
-    # 直接读 .weight；把它反量化成普通 weight，不走 LinearW4A16。
+    # The MoE router (mlp.gate) is also GPTQ-quantized, but the router needs fp16 precision
+    # and moe_router reads .weight directly; dequantize it to a plain weight, bypassing LinearW4A16.
     from mini_qwen.quantization.packing import unpack_int4
     router_names = {n for n in quant_names if n.endswith(".mlp.gate")}
     quant_names -= router_names
 
     def _dequant_gptq(name):
-        qw = sd[name + ".qweight"]            # [K//8, N] int32，沿 K 打包
-        qz = sd[name + ".qzeros"]             # [G, N//8] int32，沿 N 打包
+        qw = sd[name + ".qweight"]            # [K//8, N] int32, packed along K
+        qz = sd[name + ".qzeros"]             # [G, N//8] int32, packed along N
         sc = sd[name + ".scales"].float()     # [G, N]
         K = qw.shape[0] * 8
         N = qw.shape[1]
@@ -228,7 +228,7 @@ def load_moe_from_gptq(
         for g in range(G):
             s, e = g * group_size, (g + 1) * group_size
             w[s:e] = (w_int[s:e] - (z_int[g][None, :] + off)) * sc[g][None, :]
-        return w.t().contiguous()             # [N, K] = nn.Linear weight (out, in)
+        return w.t().contiguous()             # [N, K] = nn.Linear weight layout (out, in)
 
     def set_submodule(root, name, new_mod):
         parts = name.split(".")
@@ -241,7 +241,7 @@ def load_moe_from_gptq(
         else:
             setattr(parent, last, new_mod)
 
-    # 替换量化 Linear → LinearW4A16
+    # Replace quantized Linears with LinearW4A16
     for name in quant_names:
         new = LinearW4A16.from_gptq(
             sd[name + ".qweight"], sd[name + ".qzeros"], sd[name + ".scales"],
@@ -249,7 +249,7 @@ def load_moe_from_gptq(
         )
         set_submodule(model, name, new)
 
-    # 非量化参数（norm/gate/embed/lm_head/q_norm/k_norm）→ 直接 assign
+    # Non-quantized parameters (norm/gate/embed/lm_head/q_norm/k_norm) -> assign directly
     nonq = {
         k: v.to(dtype)
         for k, v in sd.items()
@@ -265,7 +265,7 @@ def load_moe_from_gptq(
     del sd, nonq
     gc.collect()
 
-    # 重建 RoPE buffer（meta → real）
+    # Rebuild RoPE buffers (meta -> real)
     inv_freq = 1.0 / (
         our_config.rope_theta
         ** (torch.arange(0, our_config.head_dim, 2, dtype=torch.float32) / our_config.head_dim)
@@ -276,6 +276,6 @@ def load_moe_from_gptq(
             m._build_cache(our_config.max_position_embeddings)
 
     model.to(device)
-    print(f"✓  GPTQ 加载完成：量化 {len(quant_names)} 个 Linear，device={device}", flush=True)
+    print(f"✓  GPTQ load complete: quantized {len(quant_names)} Linears, device={device}", flush=True)
     return model
 

@@ -22,7 +22,7 @@ class RotaryEmbedding(nn.Module):
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """实数实现复数旋转：[x1, x2] -> [-x2, x1]。"""
+    """Real-valued implementation of complex rotation: [x1, x2] -> [-x2, x1]."""
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat([-x2, x1], dim=-1)

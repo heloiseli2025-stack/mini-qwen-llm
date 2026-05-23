@@ -1,7 +1,7 @@
-"""Qwen3 MoE FFN 块（M4 实现）。
+"""Qwen3 MoE FFN block (M4 implementation).
 
-Qwen3 MoE 特点：128 expert，top-8 路由，无 shared expert。
-模块命名与 HF Qwen3MoEForCausalLM 完全一致，方便直接 load_state_dict。
+Qwen3 MoE characteristics: 128 experts, top-8 routing, no shared experts.
+Module names exactly match HF Qwen3MoEForCausalLM for direct load_state_dict compatibility.
 """
 import torch
 import torch.nn as nn
@@ -13,7 +13,7 @@ from mini_qwen.kernels.moe_unpermute import moe_unpermute
 
 
 class _ExpertMLP(nn.Module):
-    """单个 expert 的 SwiGLU MLP。命名与 HF experts[e].gate_proj / up_proj / down_proj 一致。"""
+    """SwiGLU MLP for a single expert. Names match HF experts[e].gate_proj / up_proj / down_proj."""
 
     def __init__(self, config):
         super().__init__()
@@ -26,13 +26,13 @@ class _ExpertMLP(nn.Module):
 
 
 class Qwen3MoEBlock(nn.Module):
-    """Qwen3 MoE FFN 块。
+    """Qwen3 MoE FFN block.
 
-    forward 流程：
-      1. moe_router → topk_ids [T, K], topk_weights [T, K]
-      2. moe_permute → permuted_hidden [T*K, H], expert_offsets [E+1]
-      3. per-expert SwiGLU（支持 nn.Linear BF16 和 LinearW4A16）
-      4. moe_unpermute → 加权还原 [T, H]
+    Forward flow:
+      1. moe_router -> topk_ids [T, K], topk_weights [T, K]
+      2. moe_permute -> permuted_hidden [T*K, H], expert_offsets [E+1]
+      3. per-expert SwiGLU (supports nn.Linear BF16 and LinearW4A16)
+      4. moe_unpermute -> weighted reduction [T, H]
     """
 
     def __init__(self, config):
@@ -41,9 +41,9 @@ class Qwen3MoEBlock(nn.Module):
         self.num_experts_per_tok = config.num_experts_per_tok
         self.norm_topk_prob      = getattr(config, "norm_topk_prob", True)
 
-        # router：命名与 HF mlp.gate.weight 对应
+        # router: name matches HF mlp.gate.weight
         self.gate    = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-        # experts：命名与 HF mlp.experts.{e}.* 对应
+        # experts: names match HF mlp.experts.{e}.*
         self.experts = nn.ModuleList([_ExpertMLP(config) for _ in range(config.num_experts)])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -68,9 +68,9 @@ class Qwen3MoEBlock(nn.Module):
         return out.reshape(orig_shape)
 
     def quantize_to_w4a16(self, group_size: int = 128) -> None:
-        """将所有 expert 的 Linear 替换为 LinearW4A16（原地替换，减少显存占用）。"""
+        """Replace all expert Linears with LinearW4A16 in-place to reduce GPU memory usage."""
         from mini_qwen.model.layers.linear_w4a16 import LinearW4A16
-        # LinearW4A16.from_float 内部创建新模块时默认在 CPU，必须显式移回原设备
+        # LinearW4A16.from_float creates new modules on CPU by default; must explicitly move back to original device
         device = next(self.parameters()).device
         for expert in self.experts:
             expert.gate_proj = LinearW4A16.from_float(expert.gate_proj, group_size).to(device)

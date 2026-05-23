@@ -1,6 +1,6 @@
-"""Triton Fused RMSNorm Kernel（可选优化，PyTorch 实现已够用时跳过）。"""
+"""Triton Fused RMSNorm Kernel (optional optimization; skip if the PyTorch implementation is sufficient)."""
 import torch
 
 
 def triton_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    raise NotImplementedError("按需在 M2 之后实现")
+    raise NotImplementedError("Implement on demand after M2")

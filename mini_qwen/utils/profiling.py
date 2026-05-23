@@ -1,4 +1,4 @@
-"""性能分析工具：计时、显存统计。"""
+"""Performance analysis utilities: timing and GPU memory statistics."""
 import time
 from contextlib import contextmanager
 import torch
@@ -6,7 +6,7 @@ import torch
 
 @contextmanager
 def cuda_timer(name: str = ""):
-    """CUDA event 计时，精度到微秒。CPU fallback 用 time.perf_counter。"""
+    """CUDA event timer with microsecond precision. Falls back to time.perf_counter on CPU."""
     if torch.cuda.is_available():
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
@@ -25,7 +25,7 @@ def cuda_timer(name: str = ""):
 
 
 def peak_memory_gb() -> float:
-    """返回 GPU 显存峰值（GB）。"""
+    """Return peak GPU memory usage in GB."""
     if torch.cuda.is_available():
         return torch.cuda.max_memory_allocated() / 1e9
     return 0.0

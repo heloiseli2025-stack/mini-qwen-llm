@@ -1,9 +1,9 @@
-"""物理 Block 分配与回收。
+"""Physical Block allocation and deallocation.
 
-§3.5.2 冻结接口：
+§3.5.2 Frozen interface:
     block_table[seq_id, virtual_block_idx] = physical_block_id
     shape: [max_num_seqs, max_blocks_per_seq], dtype=int32
-    -1 表示未分配。
+    -1 indicates unallocated.
 """
 from __future__ import annotations
 
@@ -11,9 +11,9 @@ import math
 
 
 class BlockManager:
-    """管理物理 KV cache block 的分配与回收。
+    """Manages allocation and deallocation of physical KV cache blocks.
 
-    使用 free-list 实现 O(1) 分配和释放。
+    Uses a free-list for O(1) allocation and deallocation.
     """
 
     def __init__(self, num_blocks: int, block_size: int = 16):
@@ -23,33 +23,33 @@ class BlockManager:
         self._seq_blocks: dict[int, list[int]] = {}
 
     def allocate(self, seq_id: int, num_tokens: int) -> list[int]:
-        """为 seq_id 分配足够容纳 num_tokens 的物理 block，返回 block id 列表。
+        """Allocate enough physical blocks to hold num_tokens for seq_id, returning a list of block ids.
 
-        若空闲 block 不足，抛出 RuntimeError（OOM）。
+        Raises RuntimeError (OOM) if there are insufficient free blocks.
         """
         num_needed = math.ceil(num_tokens / self.block_size)
         if len(self._free) < num_needed:
             raise RuntimeError(
-                f"KV cache OOM：需要 {num_needed} blocks，仅剩 {len(self._free)}"
+                f"KV cache OOM: need {num_needed} blocks, only {len(self._free)} remaining"
             )
         blocks = [self._free.pop() for _ in range(num_needed)]
         self._seq_blocks.setdefault(seq_id, []).extend(blocks)
         return blocks
 
     def append_block(self, seq_id: int) -> int:
-        """为已有 seq_id 追加一个新物理 block（decode 阶段按需扩展）。"""
+        """Append one new physical block to an existing seq_id (on-demand expansion during decode)."""
         if not self._free:
-            raise RuntimeError("KV cache OOM：无空闲 block")
+            raise RuntimeError("KV cache OOM: no free blocks")
         block_id = self._free.pop()
         self._seq_blocks.setdefault(seq_id, []).append(block_id)
         return block_id
 
     def free(self, seq_id: int) -> None:
-        """释放 seq_id 占用的全部物理 block。"""
+        """Release all physical blocks held by seq_id."""
         self._free.extend(self._seq_blocks.pop(seq_id, []))
 
     def get_block_ids(self, seq_id: int) -> list[int]:
-        """返回 seq_id 当前持有的物理 block id 列表。"""
+        """Return the list of physical block ids currently held by seq_id."""
         return self._seq_blocks.get(seq_id, [])
 
     @property

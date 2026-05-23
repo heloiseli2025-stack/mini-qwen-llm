@@ -13,7 +13,7 @@ def top_p_sample(logits: torch.Tensor, top_p: float = 0.9, temperature: float = 
     probs = F.softmax(logits, dim=-1)
     sorted_probs, sorted_idx = torch.sort(probs, descending=True, dim=-1)
     cumsum = torch.cumsum(sorted_probs, dim=-1)
-    # 移除累积概率超过 top_p 的 token
+    # Remove tokens whose cumulative probability exceeds top_p
     sorted_probs[cumsum - sorted_probs > top_p] = 0.0
     sorted_probs.div_(sorted_probs.sum(dim=-1, keepdim=True))
     next_token = torch.multinomial(sorted_probs, num_samples=1)

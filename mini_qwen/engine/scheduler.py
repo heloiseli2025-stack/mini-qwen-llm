@@ -1,4 +1,4 @@
-"""Continuous Batching 调度器（M5 阶段实现）。"""
+"""Continuous Batching scheduler (implemented in M5)."""
 from __future__ import annotations
 
 import math
@@ -9,11 +9,11 @@ from mini_qwen.engine.sequence import Sequence
 
 
 class Scheduler:
-    """Prefill/Decode 分离调度器。
+    """Prefill/Decode separated scheduler.
 
-    策略：running 非空时优先做 decode；否则从 waiting 取一批做 prefill。
-    Block 预分配在 step() 内完成，run_decode 内部不做任何分配。
-    不支持抢占（OOM 时新请求留在 waiting）。
+    Policy: when running is non-empty, prioritize decode; otherwise take a batch from waiting for prefill.
+    Block pre-allocation is done inside step(); run_decode performs no allocation.
+    Preemption is not supported (new requests stay in waiting on OOM).
     """
 
     def __init__(
@@ -32,19 +32,19 @@ class Scheduler:
         self.waiting.append(seq)
 
     def step(self) -> tuple[list[Sequence], str]:
-        """返回本步骤要处理的序列列表 + 模式（"prefill" 或 "decode"）。"""
+        """Return the list of sequences to process this step and the mode ("prefill" or "decode")."""
         if self.running:
-            # decode 前为每条序列预分配新 block（新 token 写入位置 = total_len-1，若为新页首槽则分配）
+            # Before decode, pre-allocate a new block for each sequence (write position = total_len-1; allocate if it's the first slot of a new page)
             for seq in self.running:
-                total = seq.total_len  # 当前已有 token 数；新 K/V 写入位置 = total_len - 1
+                total = seq.total_len  # current token count; new K/V write position = total_len - 1
                 if (total - 1) % self.block_manager.block_size == 0:
                     if self.block_manager.num_free_blocks == 0:
-                        continue   # OOM：跳过，让该序列使用旧 block 末尾
+                        continue   # OOM: skip, let the sequence continue using the tail of the old block
                     new_block = self.block_manager.append_block(seq.seq_id)
                     seq.block_ids.append(new_block)
             return list(self.running), "decode"
 
-        # prefill：从 waiting 取尽可能多（受 max_seqs 和 max_prefill_tokens 双重限制）
+        # prefill: take as many as possible from waiting (bounded by max_seqs and max_prefill_tokens)
         batch: list[Sequence] = []
         total_tokens = 0
         while self.waiting and len(batch) < self.max_seqs:
@@ -54,7 +54,7 @@ class Scheduler:
                 break
             num_blocks = math.ceil(seq_len / self.block_manager.block_size)
             if self.block_manager.num_free_blocks < num_blocks:
-                break   # OOM：新请求留在 waiting
+                break   # OOM: new request stays in waiting
             self.waiting.popleft()
             self.block_manager.allocate(seq.seq_id, seq_len)
             seq.block_ids.extend(self.block_manager.get_block_ids(seq.seq_id))

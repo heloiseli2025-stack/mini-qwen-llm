@@ -1,6 +1,6 @@
-"""Paged Attention Decode Kernel（M1.1–M1.4 实现）。
+"""Paged Attention Decode Kernel (M1.1-M1.4 implementation).
 
-FROZEN SIGNATURE（M1 完成后冻结，改动须 owner 批准）：
+FROZEN SIGNATURE (frozen after M1 is complete, changes require owner approval):
   paged_attn_decode(
       q:           [batch, num_q_heads, head_dim], bf16
       k_cache:     [num_blocks, block_size, num_kv_heads, head_dim], bf16
@@ -23,7 +23,7 @@ def _check_inputs(q, k_cache, v_cache, block_table, seq_lens):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# M1.1 — Naive two-pass decode（fp32，无 GQA）
+# M1.1 — Naive two-pass decode (fp32, no GQA)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @triton.jit
@@ -38,7 +38,7 @@ def _paged_decode_v1_kernel(
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
-    """两遍扫描：第一遍找 max score，第二遍 softmax + 加权 V。"""
+    """Two-pass scan: first pass finds max score, second pass computes softmax + weighted V sum."""
     batch_id = tl.program_id(0)
     head_id  = tl.program_id(1)
 
@@ -213,7 +213,7 @@ def paged_attn_decode_v2(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# M1.3 — Online softmax（单遍，FlashAttention v2 风格）
+# M1.3 — Online softmax (single-pass, FlashAttention v2 style)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @triton.jit
@@ -229,7 +229,7 @@ def _paged_decode_v3_kernel(
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
-    """单遍 online softmax：running max m_i + running sum l_i + acc。"""
+    """Single-pass online softmax: running max m_i + running sum l_i + acc."""
     batch_id   = tl.program_id(0)
     head_id    = tl.program_id(1)
     kv_head_id = head_id // NUM_KV_GROUPS
@@ -257,7 +257,7 @@ def _paged_decode_v3_kernel(
             score = tl.sum(q * k) * scale
             score = tl.where(valid, score, float('-inf'))
 
-            # 安全的 online softmax 更新（valid=False 时 m_i 不变，alpha=1, beta=0）
+            # safe online softmax update (when valid=False, m_i unchanged, alpha=1, beta=0)
             m_new = tl.where(valid, tl.maximum(m_i, score), m_i)
             alpha = tl.exp(m_i - m_new)
             beta  = tl.where(valid, tl.exp(score - m_new), 0.0)
@@ -282,7 +282,7 @@ def paged_attn_decode_v3(
     seq_lens: torch.Tensor,
     num_kv_groups: int,
 ) -> torch.Tensor:
-    """M1.3 online softmax decode with GQA（输入可以是 bf16）。"""
+    """M1.3 online softmax decode with GQA (input can be bf16)."""
     _check_inputs(q, k_cache, v_cache, block_table, seq_lens)
     B, H_q, D = q.shape
     block_size = k_cache.shape[1]
@@ -304,7 +304,7 @@ def paged_attn_decode_v3(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# M1.4 — 向量化（整页加载）+ autotune
+# M1.4 — vectorized (full-page load) + autotune
 # ══════════════════════════════════════════════════════════════════════════════
 
 @triton.autotune(
@@ -330,7 +330,7 @@ def _paged_decode_v4_kernel(
     BLOCK_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
-    """向量化版本：整页一次性 load K/V，block-wise online softmax。"""
+    """Vectorized version: load full page of K/V at once, block-wise online softmax."""
     batch_id   = tl.program_id(0)
     head_id    = tl.program_id(1)
     kv_head_id = head_id // NUM_KV_GROUPS
@@ -349,24 +349,24 @@ def _paged_decode_v4_kernel(
 
     for page_idx in range(num_pages):
         phys       = tl.load(Block_table + batch_id * stride_tb + page_idx * stride_tp)
-        token_offs = page_idx * BLOCK_SIZE + s_range  # [BS] 每个 slot 的全局 token 下标
+        token_offs = page_idx * BLOCK_SIZE + s_range  # [BS] global token index for each slot
         mask       = token_offs < seq_len             # [BS]
 
-        # 整页 load K/V: [BLOCK_SIZE, HEAD_DIM]
+        # full-page load K/V: [BLOCK_SIZE, HEAD_DIM]
         k_base = K_cache + phys * stride_kb + kv_head_id * stride_kh
         k = tl.load(
             k_base + s_range[:, None] * stride_ks + d_range[None, :],
             mask=mask[:, None], other=0.0,
         ).to(tl.float32)  # [BS, D]
 
-        # 向量化 score: [BS]
+        # vectorized scores: [BS]
         scores = tl.sum(q[None, :] * k, axis=1) * scale
         scores = tl.where(mask, scores, float('-inf'))
 
-        # Block-wise online softmax（安全处理全无效 page）
+        # Block-wise online softmax (safely handles all-invalid pages)
         m_block = tl.max(scores, 0)
         m_new   = tl.maximum(m_i, m_block)
-        # 两者都是 -inf 时避免 NaN：alpha=1（l_i=0 acc=0，结果不变）
+        # avoid NaN when both are -inf: alpha=1 (l_i=0 acc=0, result unchanged)
         alpha   = tl.where(m_new != float('-inf'), tl.exp(m_i - m_new), 1.0)
         p       = tl.exp(scores - m_new)  # [BS]
         p       = tl.where(mask, p, 0.0)
@@ -393,7 +393,7 @@ def paged_attn_decode(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
 ) -> torch.Tensor:
-    """M1.4 vectorized paged attention decode（公共接口，返回 bf16）。
+    """M1.4 vectorized paged attention decode (public interface, returns bf16).
 
     q:           [batch, num_q_heads, head_dim], bf16
     k_cache:     [num_blocks, block_size, num_kv_heads, head_dim], bf16

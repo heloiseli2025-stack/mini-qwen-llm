@@ -1,18 +1,18 @@
-"""MoE Grouped GEMM Kernel（M4.3 实现）。
+"""MoE Grouped GEMM Kernel (M4.3 implementation).
 
-为每个 expert 计算一个 GEMM：out[s:t] = permuted_hidden[s:t] @ W[e].T
-其中 [s, t) 由 expert_offsets 确定。
+Computes one GEMM per expert: out[s:t] = permuted_hidden[s:t] @ W[e].T
+where [s, t) is determined by expert_offsets.
 
-实现：
-- _moe_grouped_gemm_oracle：BF16 for-loop，用于正确性对比
-- moe_grouped_gemm：Triton kernel，动态 grid 只启动 active experts
+Implementation:
+- _moe_grouped_gemm_oracle: BF16 for-loop, used for correctness comparison
+- moe_grouped_gemm: Triton kernel, dynamic grid launches only active experts
 """
 import torch
 import triton
 import triton.language as tl
 
 
-# ── for-loop oracle（正确性参考）────────────────────────────────────────────────
+# ── for-loop oracle (correctness reference) ─────────────────────────────────
 
 def _moe_grouped_gemm_oracle(
     permuted_hidden: torch.Tensor,   # [T*K, H]
@@ -37,7 +37,7 @@ def _moe_grouped_gemm_oracle(
     return out
 
 
-# ── Triton kernel（性能版）───────────────────────────────────────────────────
+# ── Triton kernel (performance version) ─────────────────────────────────────
 
 @triton.autotune(
     configs=[
@@ -56,33 +56,33 @@ def _grouped_gemm_kernel(
     stride_xr, stride_xh,
     stride_we, stride_wd, stride_wh,
     stride_or, stride_od,
-    BLOCK_M: tl.constexpr,   # 固定 16，通过 mask 处理 n_e < 16 的情况
+    BLOCK_M: tl.constexpr,   # fixed 16, mask handles cases where n_e < 16
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    pid_e = tl.program_id(0)   # 第几个 active expert
+    pid_e = tl.program_id(0)   # index of active expert
     pid_n = tl.program_id(1)   # output feature tile
-    pid_m = tl.program_id(2)   # token tile（动态 grid 的第三维）
+    pid_m = tl.program_id(2)   # token tile (third dimension of dynamic grid)
 
     start = tl.load(active_starts + pid_e).to(tl.int32)
     end   = tl.load(active_ends   + pid_e).to(tl.int32)
     e     = tl.load(active_experts + pid_e).to(tl.int32)
     n_e   = end - start
 
-    # 当前 M tile 超出该 expert 的 token 范围则直接退出
+    # exit early if current M tile exceeds this expert's token range
     if pid_m * BLOCK_M >= n_e:
         return
 
     m_off  = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     m_mask = m_off < n_e
-    x_row  = start + m_off     # [BLOCK_M] 在 permuted_hidden 里的绝对行索引
+    x_row  = start + m_off     # [BLOCK_M] absolute row index in permuted_hidden
 
     n_off  = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = n_off < D
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-    # H 在 autotune key 里，编译时确定 → 循环展开
+    # H is in the autotune key, determined at compile time -> loop unrolled
     for k in range((H + BLOCK_K - 1) // BLOCK_K):
         k_off  = k * BLOCK_K + tl.arange(0, BLOCK_K)
         k_mask = k_off < H
@@ -92,7 +92,7 @@ def _grouped_gemm_kernel(
             mask=m_mask[:, None] & k_mask[None, :], other=0.0,
         ).to(tl.float32)                                       # [BLOCK_M, BLOCK_K]
 
-        # W[e] 形状 [D, H]，需要转置成 [H, D] 做 X @ W.T = [BLOCK_M, BLOCK_K] × [BLOCK_K, BLOCK_N]
+        # W[e] has shape [D, H], needs to be transposed to [H, D] for X @ W.T = [BLOCK_M, BLOCK_K] x [BLOCK_K, BLOCK_N]
         w_tile = tl.load(
             W + e * stride_we + n_off[:, None] * stride_wd + k_off[None, :] * stride_wh,
             mask=n_mask[:, None] & k_mask[None, :], other=0.0,
@@ -107,9 +107,9 @@ def _grouped_gemm_kernel(
     )
 
 
-# ── 公开接口 ──────────────────────────────────────────────────────────────────
+# ── public interface ──────────────────────────────────────────────────────────
 
-_BLOCK_M = 16  # 固定 M tile，与 Triton constexpr 对齐
+_BLOCK_M = 16  # fixed M tile, aligned with Triton constexpr
 
 
 def moe_grouped_gemm(
@@ -117,9 +117,9 @@ def moe_grouped_gemm(
     expert_weights: torch.Tensor,    # [num_experts, intermediate_size, hidden_dim]
     expert_offsets: torch.Tensor,    # [num_experts + 1]
 ) -> torch.Tensor:
-    """Grouped GEMM：为每个 expert 计算 out[s:t] = permuted_hidden[s:t] @ W[e].T。
+    """Grouped GEMM: computes out[s:t] = permuted_hidden[s:t] @ W[e].T for each expert.
 
-    自动跳过空 expert；只对 active expert 启动 Triton program。
+    Automatically skips empty experts; only launches Triton programs for active experts.
     """
     if not permuted_hidden.is_cuda:
         return _moe_grouped_gemm_oracle(permuted_hidden, expert_weights, expert_offsets)
@@ -131,7 +131,7 @@ def moe_grouped_gemm(
     if total_slots == 0:
         return out
 
-    # 只启动 active expert（n_e > 0），decode 时通常 ≤ 8 个
+    # only launch active experts (n_e > 0), typically <= 8 during decode
     active = (expert_offsets[1:] > expert_offsets[:-1]).nonzero(as_tuple=True)[0]
     if active.shape[0] == 0:
         return out.zero_()

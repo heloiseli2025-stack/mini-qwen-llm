@@ -1,16 +1,16 @@
-"""W4A16 GEMM Decode Kernel（M3 实现，优化版）。
+"""W4A16 GEMM Decode Kernel (M3 implementation, optimized).
 
-优化：
-- GEMM kernel（M>1）：2D tile load 代替 8 次独立 scalar load，减少 HBM cache miss
-- M=1 专用 GEMV kernel：scalar X broadcast + 向量 w_fp，全 SM 利用
-- dequant 全程 fp32；shifts 用 literal 常量，Triton 编译时展开
+Optimizations:
+- GEMM kernel (M>1): 2D tile load instead of 8 independent scalar loads, reduces HBM cache misses
+- M=1 dedicated GEMV kernel: scalar X broadcast + vectorized w_fp, full SM utilization
+- dequant entirely in fp32; shifts use literal constants, unrolled at Triton compile time
 
 # === FROZEN SIGNATURE ===
 # def w4a16_gemm(
 #     x:          [M, K], bf16
-#     qweight:    [K // 8, N], int32（packed int4，nibble i of qweight[j,n] = weight[8j+i,n]）
+#     qweight:    [K // 8, N], int32 (packed int4, nibble i of qweight[j,n] = weight[8j+i,n])
 #     scales:     [K // group_size, N], bf16
-#     qzeros:     [K // group_size, N // 8], int32（packed int4，沿 N 维）
+#     qzeros:     [K // group_size, N // 8], int32 (packed int4 along N dimension)
 #     group_size: int = 128
 # ) -> [M, N], bf16
 """
@@ -19,7 +19,7 @@ import triton
 import triton.language as tl
 
 
-# ── GEMM kernel（M > 1）────────────────────────────────────────────────────────
+# ── GEMM kernel (M > 1) ───────────────────────────────────────────────────────
 
 @triton.autotune(
     configs=[
@@ -69,7 +69,7 @@ def _w4a16_gemm_kernel(
         ).to(tl.int32)
         zero = ((qz_row >> z_shift) & 0xF).to(tl.float32)
 
-        # 每次处理 16 个 K（两行 qweight），满足 tl.dot K≥16 的要求
+        # process 16 K values at a time (two qweight rows), satisfying tl.dot K>=16 requirement
         for pair in tl.static_range(group_size // 16):
             k_base = g_start + pair * 16
             j0 = g * (group_size // 8) + pair * 2
@@ -80,7 +80,7 @@ def _w4a16_gemm_kernel(
             qw1 = tl.load(QW + j1 * stride_qwk + n_offs * stride_qwn,
                           mask=n_mask, other=0).to(tl.int32)   # [BLOCK_N]
 
-            # 构造 [16, BLOCK_N] w_fp：前 8 行来自 qw0，后 8 行来自 qw1
+            # build [16, BLOCK_N] w_fp: first 8 rows from qw0, last 8 rows from qw1
             k16_idx  = tl.expand_dims(tl.arange(0, 16), 1)    # [16, 1]: 0..15
             shifts   = (k16_idx % 8) * 4                        # [16, 1]: 0,4,...,28 × 2
             selector = k16_idx // 8                              # [16, 1]: 0*8 then 1*8
@@ -98,14 +98,14 @@ def _w4a16_gemm_kernel(
                 mask=m_mask[:, None], other=0.0,
             ).to(tl.float32)  # [BLOCK_M, 16]
 
-            # tl.dot: [BLOCK_M, 16] × [16, BLOCK_N] → [BLOCK_M, BLOCK_N]（K=16 满足 Triton 要求）
+            # tl.dot: [BLOCK_M, 16] x [16, BLOCK_N] -> [BLOCK_M, BLOCK_N] (K=16 satisfies Triton requirement)
             acc += tl.dot(x_16, w_fp_16, out_dtype=tl.float32)
 
     out_ptrs = Out + m_offs[:, None] * stride_om + n_offs[None, :] * stride_on
     tl.store(out_ptrs, acc.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :])
 
 
-# ── GEMV kernel（M=1 专用）────────────────────────────────────────────────────
+# ── GEMV kernel (M=1 dedicated) ──────────────────────────────────────────────
 
 @triton.autotune(
     configs=[
@@ -167,7 +167,7 @@ def _w4a16_gemv_kernel(
             w_fp6 = (((qw >> 24) & 0xF).to(tl.float32) - zero) * scale
             w_fp7 = (((qw >> 28) & 0xF).to(tl.float32) - zero) * scale
 
-            # X: scalar broadcast；M=1 只有 1 行，K 维连续，全部命中 L1
+            # X: scalar broadcast; M=1 has only 1 row, K dimension is contiguous, all hits L1
             x0 = tl.load(X + (k_base + 0) * stride_xk).to(tl.float32)
             x1 = tl.load(X + (k_base + 1) * stride_xk).to(tl.float32)
             x2 = tl.load(X + (k_base + 2) * stride_xk).to(tl.float32)
@@ -189,7 +189,7 @@ def _w4a16_gemv_kernel(
     tl.store(Out + n_offs, acc.to(tl.bfloat16), mask=n_mask)
 
 
-# ── 公开接口 ──────────────────────────────────────────────────────────────────
+# ── public interface ──────────────────────────────────────────────────────────
 
 def w4a16_gemm(
     x: torch.Tensor,
@@ -198,14 +198,14 @@ def w4a16_gemm(
     qzeros: torch.Tensor,
     group_size: int = 128,
 ) -> torch.Tensor:
-    """W4A16 GEMM：x @ dequant(qweight)。
+    """W4A16 GEMM: x @ dequant(qweight).
 
     Args:
         x:          [M, K] bf16
         qweight:    [K//8, N] int32
         scales:     [K//group_size, N] bf16
         qzeros:     [K//group_size, N//8] int32
-        group_size: 默认 128
+        group_size: default 128
 
     Returns:
         [M, N] bf16

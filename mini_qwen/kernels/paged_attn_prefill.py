@@ -1,6 +1,6 @@
-"""Paged Attention Prefill Kernel（M1.5 实现）。
+"""Paged Attention Prefill Kernel (M1.5 implementation).
 
-FROZEN SIGNATURE（M1.5 完成后冻结）：
+FROZEN SIGNATURE (frozen after M1.5 is complete):
   paged_attn_prefill(
       q:           [total_tokens, num_q_heads, head_dim], bf16
       k:           [total_tokens, num_kv_heads, head_dim], bf16
@@ -20,7 +20,7 @@ import triton.language as tl
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 辅助：将 K/V 写入 paged cache
+# helper: write K/V to paged cache
 # Grid: (total_tokens, H_kv)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -57,7 +57,7 @@ def _write_kv_cache_kernel(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# M1.5 — FlashAttention v2 风格 prefill kernel（bf16 输入，fp32 累加）
+# M1.5 — FlashAttention v2 style prefill kernel (bf16 input, fp32 accumulation)
 # Grid: (ceil(max_seqlen / BLOCK_Q), batch, H_q)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -74,7 +74,7 @@ def _write_kv_cache_kernel(
 def _paged_prefill_attn_kernel(
     Q, K, V,              # [total, H_q / H_kv, D]  bf16
     Cu_seqlens,           # [batch+1] int32
-    Out,                  # [total, H_q, D]  fp32（caller 再转 bf16）
+    Out,                  # [total, H_q, D]  fp32 (caller converts to bf16)
     stride_qt, stride_qh, stride_qd,
     stride_kt, stride_kh, stride_kd,
     stride_vt, stride_vh, stride_vd,
@@ -101,7 +101,7 @@ def _paged_prefill_attn_kernel(
     q_range = q_start + tl.arange(0, BLOCK_Q)
     q_mask  = q_range < seq_len
 
-    # Load Q 为 bf16（保持原始类型，供 Tensor Core 使用）
+    # Load Q as bf16 (keep original dtype for Tensor Core usage)
     q_ptrs = (Q + (seq_start + q_range)[:, None] * stride_qt
                + head_id * stride_qh
                + d_range[None, :])
@@ -121,13 +121,13 @@ def _paged_prefill_attn_kernel(
         causal    = q_range[:, None] >= kv_range[None, :]
         full_mask = causal & kv_mask[None, :] & q_mask[:, None]
 
-        # Load K 为 bf16
+        # Load K as bf16
         k_ptrs = (K + (seq_start + kv_range)[:, None] * stride_kt
                    + kv_head_id * stride_kh
                    + d_range[None, :])
         k_tile = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0).to(tl.bfloat16)  # [BKV, D]
 
-        # Tensor Core: bf16 @ bf16.T → 默认 fp32 累加
+        # Tensor Core: bf16 @ bf16.T → fp32 accumulation by default
         scores = tl.dot(q_tile, tl.trans(k_tile)).to(tl.float32) * scale
         scores = tl.where(full_mask, scores, float('-inf'))
 
@@ -139,7 +139,7 @@ def _paged_prefill_attn_kernel(
         p = tl.where(full_mask, p, 0.0)
         l_i = alpha * l_i + tl.sum(p, 1)
 
-        # Load V 为 bf16
+        # Load V as bf16
         v_ptrs = (V + (seq_start + kv_range)[:, None] * stride_vt
                    + kv_head_id * stride_vh
                    + d_range[None, :])
@@ -157,7 +157,7 @@ def _paged_prefill_attn_kernel(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 公共接口
+# public interface
 # ══════════════════════════════════════════════════════════════════════════════
 
 def paged_attn_prefill(
@@ -170,7 +170,7 @@ def paged_attn_prefill(
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
 ) -> torch.Tensor:
-    """M1.5 FlashAttention-style causal prefill + KV cache 写入（返回 bf16）。
+    """M1.5 FlashAttention-style causal prefill + KV cache write (returns bf16).
 
     q/k/v:       [total_tokens, H_q/H_kv, head_dim], bf16
     k_cache/v_cache: [num_blocks, block_size, H_kv, head_dim], bf16
@@ -188,18 +188,18 @@ def paged_attn_prefill(
     page_size       = k_cache.shape[1]
     device          = q.device
 
-    # ── 1. batch_ids / positions（全 CUDA，无 Python 循环）──────────────────
-    # batch_ids[i] = 该 token 属于哪个 sequence
+    # ── 1. batch_ids / positions (all CUDA, no Python loop) ──────────────────
+    # batch_ids[i] = which sequence this token belongs to
     batch_ids = torch.repeat_interleave(
         torch.arange(B, dtype=torch.int32, device=device),
         (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64),
     )  # [total]
-    # positions[i] = 该 token 在其 sequence 内的偏移
+    # positions[i] = offset of this token within its sequence
     token_indices = torch.arange(total, dtype=torch.int32, device=device)
     seq_starts    = cu_seqlens[batch_ids.to(torch.int64)]        # [total]
     positions     = token_indices - seq_starts                    # [total]
 
-    # ── 2. K/V scatter → paged cache ──────────────────────────────────────
+    # ── 2. K/V scatter → paged cache ─────────────────────────────────────
     _write_kv_cache_kernel[(total, H_kv)](
         k, v, k_cache, v_cache,
         block_table, batch_ids, positions,
@@ -212,12 +212,12 @@ def paged_attn_prefill(
         HEAD_DIM=D,
     )
 
-    # ── 3. FlashAttention prefill（bf16 输入，Tensor Core）──────────────────
+    # ── 3. FlashAttention prefill (bf16 input, Tensor Core) ──────────────────
     out  = torch.empty(total, H_q, D, dtype=torch.float32, device=device)
     grid = lambda meta: (triton.cdiv(max_seqlen, meta['BLOCK_Q']), B, H_q)
 
     _paged_prefill_attn_kernel[grid](
-        q.contiguous(), k, v,        # 保持 bf16，无 fp32 转换
+        q.contiguous(), k, v,        # keep bf16, no fp32 conversion
         cu_seqlens, out,
         *q.stride(),
         *k.stride(),
@@ -235,9 +235,9 @@ def write_kv_decode(
     k_cache: torch.Tensor,      # [num_blocks, block_size, H_kv, head_dim]
     v_cache: torch.Tensor,
     block_table: torch.Tensor,  # [B, max_blocks] int32
-    positions: torch.Tensor,    # [B] int32 — 每条序列新 token 的全局位置
+    positions: torch.Tensor,    # [B] int32 — global position of the new token in each sequence
 ) -> None:
-    """将 decode 步骤的新 K/V（每序列 1 个 token）写入 paged cache。"""
+    """Write new K/V from the decode step (1 token per sequence) into the paged cache."""
     assert k_new.is_cuda
     B, H_kv, D = k_new.shape
     page_size = k_cache.shape[1]

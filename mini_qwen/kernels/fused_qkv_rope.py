@@ -1,19 +1,19 @@
-"""Fused QKV Projection + QK-Norm + RoPE Kernel（M2 实现）。
+"""Fused QKV Projection + QK-Norm + RoPE Kernel (M2 implementation).
 
-实现策略：
-  1. QKV 投影：3 次 torch.mm（cuBLAS），不进 Triton（大 GEMM cuBLAS 更快）
-  2. QK-Norm + RoPE：1 次 Triton kernel，Q 和 K 合并在同一 grid 处理
-  3. V：直接使用 GEMM 输出，无 norm / RoPE
+Implementation strategy:
+  1. QKV projection: 3x torch.mm (cuBLAS), not in Triton (cuBLAS is faster for large GEMMs)
+  2. QK-Norm + RoPE: 1 Triton kernel, Q and K processed together in the same grid
+  3. V: used directly from GEMM output, no norm / RoPE
 
 Grid: (B*S, H_Q + H_KV)
-  pid_head 0..H_Q-1          → 处理 Q head（is_q = True）
-  pid_head H_Q..H_Q+H_KV-1  → 处理 K head（is_q = False）
+  pid_head 0..H_Q-1          -> process Q head (is_q = True)
+  pid_head H_Q..H_Q+H_KV-1  -> process K head (is_q = False)
 
-HBM 读写（Q/K 各）：
-  unfused：GEMM写 + norm读 + norm写 + rope读 + rope写 = 5 次
-  fused  ：GEMM写 + kernel读 + kernel写            = 3 次
+HBM reads/writes (per Q/K):
+  unfused: GEMM write + norm read + norm write + rope read + rope write = 5 trips
+  fused  : GEMM write + kernel read + kernel write                      = 3 trips
 
-# === FROZEN SIGNATURE ===（M2 完成后冻结）
+# === FROZEN SIGNATURE === (frozen after M2 is complete)
 # def fused_qkv_rope(
 #     x:        torch.Tensor,  # [batch, seq_len, hidden_size], bf16
 #     w_q:      torch.Tensor,  # [num_q_heads * head_dim, hidden_size], bf16
@@ -36,39 +36,39 @@ import triton.language as tl
 
 @triton.jit
 def _qk_norm_rope_kernel(
-    # ── 输入 ──────────────────────────────────────────────────────
-    Q,          # [total_tokens, H_Q, D]  raw GEMM output，bf16
-    K,          # [total_tokens, H_KV, D] raw GEMM output，bf16
-    # ── 输出 ──────────────────────────────────────────────────────
+    # ── inputs ────────────────────────────────────────────────────
+    Q,          # [total_tokens, H_Q, D]  raw GEMM output, bf16
+    K,          # [total_tokens, H_KV, D] raw GEMM output, bf16
+    # ── outputs ───────────────────────────────────────────────────
     Q_out,      # [total_tokens, H_Q, D]  bf16
     K_out,      # [total_tokens, H_KV, D] bf16
-    # ── Norm 权重 ─────────────────────────────────────────────────
+    # ── norm weights ──────────────────────────────────────────────
     q_norm_w,   # [D] bf16
     k_norm_w,   # [D] bf16
-    # ── RoPE 表 ───────────────────────────────────────────────────
+    # ── RoPE tables ───────────────────────────────────────────────
     cos,        # [S, D] bf16
     sin,        # [S, D] bf16
-    # ── 运行时标量 ────────────────────────────────────────────────
-    S,          # seq_len，用于 seq_pos = pid_tok % S
-    H_Q,        # Q head 数，用于区分 Q/K 分支
-    stride_qt,  # Q 的 token stride = H_Q * D
-    stride_kt,  # K 的 token stride = H_KV * D
-    # ── 编译时常量 ────────────────────────────────────────────────
-    D:      tl.constexpr,   # head_dim（128）
-    HALF_D: tl.constexpr,   # head_dim // 2（64）
-    EPS:    tl.constexpr,   # RMSNorm eps（1e-6）
+    # ── runtime scalars ───────────────────────────────────────────
+    S,          # seq_len, used for seq_pos = pid_tok % S
+    H_Q,        # number of Q heads, used to distinguish Q/K branches
+    stride_qt,  # token stride of Q = H_Q * D
+    stride_kt,  # token stride of K = H_KV * D
+    # ── compile-time constants ────────────────────────────────────
+    D:      tl.constexpr,   # head_dim (128)
+    HALF_D: tl.constexpr,   # head_dim // 2 (64)
+    EPS:    tl.constexpr,   # RMSNorm eps (1e-6)
 ):
     pid_tok  = tl.program_id(0)   # 0 .. B*S - 1
     pid_head = tl.program_id(1)   # 0 .. H_Q+H_KV - 1
 
     is_q = pid_head < H_Q
 
-    # K head 索引：Q 分支用 0（占位，不实际访问）
+    # K head index: Q branch uses 0 (placeholder, not actually accessed)
     k_head = tl.where(is_q, 0, pid_head - H_Q)
 
     d0 = tl.arange(0, HALF_D)   # [HALF_D]
 
-    # ── 加载输入（分两半，强制 fp32 累加）────────────────────────
+    # ── load inputs (split into two halves, force fp32 accumulation) ─────────
     if is_q:
         base = Q + pid_tok * stride_qt + pid_head * D
         x1 = tl.load(base + d0        ).to(tl.float32)
@@ -82,7 +82,7 @@ def _qk_norm_rope_kernel(
         w1 = tl.load(k_norm_w + d0        ).to(tl.float32)
         w2 = tl.load(k_norm_w + HALF_D + d0).to(tl.float32)
 
-    # ── RMSNorm（per-head，fp32 累加，防止 bf16 精度损失）─────────
+    # ── RMSNorm (per-head, fp32 accumulation to prevent bf16 precision loss) ──
     rms = tl.rsqrt((tl.sum(x1 * x1) + tl.sum(x2 * x2)) / D + EPS)
     x1_n = x1 * rms * w1
     x2_n = x2 * rms * w2
@@ -102,7 +102,7 @@ def _qk_norm_rope_kernel(
     out1 = (x1_n * cos1 - x2_n * sin1).to(tl.bfloat16)
     out2 = (x2_n * cos2 + x1_n * sin2).to(tl.bfloat16)
 
-    # ── 写回 ──────────────────────────────────────────────────────
+    # ── write back ────────────────────────────────────────────────
     if is_q:
         o_base = Q_out + pid_tok * stride_qt + pid_head * D
     else:
@@ -122,29 +122,29 @@ def fused_qkv_rope(
     cos:      torch.Tensor,   # [S, D], bf16
     sin:      torch.Tensor,   # [S, D], bf16
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """融合 QKV 投影 + QK-Norm + RoPE。
+    """Fused QKV projection + QK-Norm + RoPE.
 
-    返回 (q, k, v)，shape 均为 [B, S, H_heads, D]，dtype bf16。
+    Returns (q, k, v), all with shape [B, S, H_heads, D], dtype bf16.
     - q: [B, S, H_Q, D]
     - k: [B, S, H_KV, D]
-    - v: [B, S, H_KV, D]  直接来自 GEMM，无 norm/rope
+    - v: [B, S, H_KV, D]  directly from GEMM output, no norm/rope
     """
     B, S, H = x.shape
     D    = q_norm_w.shape[0]
     H_Q  = w_q.shape[0] // D
     H_KV = w_k.shape[0] // D
 
-    assert D % 2 == 0, "head_dim 必须是偶数（RoPE rotate_half）"
+    assert D % 2 == 0, "head_dim must be even (RoPE rotate_half)"
     HALF_D = D // 2
 
     x_2d = x.reshape(B * S, H)
 
-    # ① 三次 cuBLAS GEMM（各 1 个 kernel launch）
+    # ① three cuBLAS GEMMs (one kernel launch each)
     q = (x_2d @ w_q.T).view(B * S, H_Q,  D)
     k = (x_2d @ w_k.T).view(B * S, H_KV, D)
     v = (x_2d @ w_v.T).view(B * S, H_KV, D)
 
-    # ② 融合 QK-Norm + RoPE（1 个 Triton kernel launch）
+    # ② fused QK-Norm + RoPE (1 Triton kernel launch)
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
 

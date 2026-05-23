@@ -1,14 +1,20 @@
-"""端到端 token/s 吞吐 benchmark（M5 实现）。
+"""End-to-end token/s throughput benchmark (M5 implementation).
 
-§4.7 Benchmark 协议（冻结）：
-    - Warmup: 20 iters
+Benchmark protocol (§4.7, frozen):
+    - Warmup: 20 iters (not counted)
     - Measurement: 100 iters
-    - Report: median
-    - prompt_len=2048, gen_len=256, batch=[1,8,16,32]
+    - Report: median tok/s, p25, p75
+    - Default: prompt_len=2048, gen_len=256, batch=[1,8,16,32]
 
-使用说明：
-    python benchmarks/bench_throughput.py [--batch 1 8 16 32] [--prompt-len 2048] [--gen-len 256]
-    可选 --model-path 指向 GPTQ checkpoint；不传则用随机权重小模型（用于功能验证）。
+Usage:
+    # Toy model (random weights, fast functional check)
+    python benchmarks/bench_throughput.py --toy
+
+    # Real GPTQ model
+    python benchmarks/bench_throughput.py --model-path weights/Qwen3-30B-A3B-GPTQ-Int4
+
+    # Custom batch / length
+    python benchmarks/bench_throughput.py --model-path ... --batch 1 8 16 --prompt-len 512 --gen-len 64
 """
 from __future__ import annotations
 
@@ -26,7 +32,7 @@ from mini_qwen.engine.scheduler import Scheduler
 
 
 def _make_toy_model_and_caches(device: torch.device):
-    """创建 2 层随机权重小模型（功能验证用）。"""
+    """2-layer random-weight model for functional verification (no GPU memory needed)."""
     from mini_qwen.config import Qwen3MoEConfig
     from mini_qwen.model.qwen3_moe import Qwen3MoEForCausalLM
 
@@ -56,7 +62,7 @@ def _make_toy_model_and_caches(device: torch.device):
 
 
 def _make_real_model_and_caches(model_path: str, device: torch.device):
-    """加载真实 GPTQ checkpoint。"""
+    """Load a real GPTQ checkpoint."""
     from mini_qwen.model.loader import load_moe_from_gptq
     from mini_qwen.config import Qwen3MoEConfig
 
@@ -84,9 +90,7 @@ def bench_one(
     measure: int,
     device: torch.device,
 ) -> dict:
-    """对给定 batch_size 运行 warmup + measure 轮，返回统计数据。"""
-    prompts = [list(range(prompt_len % 512)) * (prompt_len // 512 + 1)][:prompt_len]
-    # 构造 prompt_len 长度的 token 列表
+    """Run warmup + measure rounds for a given batch_size; return stats."""
     base = list(range(512))
     prompt = (base * ((prompt_len // 512) + 1))[:prompt_len]
     prompts = [prompt[:] for _ in range(batch_size)]
@@ -109,11 +113,9 @@ def bench_one(
         total_toks = sum(len(v) for v in outs.values())
         return total_toks / elapsed   # tok/s
 
-    # warmup
     for _ in range(warmup):
         _one_iter()
 
-    # measure
     tps_list = [_one_iter() for _ in range(measure)]
     med = statistics.median(tps_list)
     p25 = sorted(tps_list)[measure // 4]
@@ -129,23 +131,23 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--measure", type=int, default=100)
     parser.add_argument("--model-path", type=str, default=None,
-                        help="GPTQ checkpoint 路径；不传则用随机权重小模型")
+                        help="Path to GPTQ checkpoint; omit to use toy random-weight model")
     parser.add_argument("--toy", action="store_true",
-                        help="强制使用随机权重小模型（覆盖 --model-path）")
+                        help="Force toy random-weight model (overrides --model-path)")
     args = parser.parse_args()
 
-    assert torch.cuda.is_available(), "需要 CUDA GPU"
+    assert torch.cuda.is_available(), "CUDA GPU required"
     device = torch.device("cuda")
 
     if args.toy or args.model_path is None:
-        print("使用随机权重小模型（功能验证模式）")
+        print("Using toy random-weight model (functional verification mode)")
         args.prompt_len = min(args.prompt_len, 64)
-        args.gen_len = min(args.gen_len, 8)
-        args.warmup = 2
-        args.measure = 5
+        args.gen_len    = min(args.gen_len, 8)
+        args.warmup     = 2
+        args.measure    = 5
         model, kv_caches, num_blocks, _, _ = _make_toy_model_and_caches(device)
     else:
-        print(f"加载 GPTQ checkpoint：{args.model_path}")
+        print(f"Loading GPTQ checkpoint: {args.model_path}")
         model, kv_caches, num_blocks, _, _ = _make_real_model_and_caches(args.model_path, device)
 
     print(f"\n{'batch':>6}  {'median tok/s':>14}  {'p25':>10}  {'p75':>10}")

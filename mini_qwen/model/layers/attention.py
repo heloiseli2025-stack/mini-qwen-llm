@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 
 from mini_qwen.model.layers.rms_norm import RMSNorm
-from mini_qwen.model.layers.rope import apply_rotary_emb, rotate_half
+from mini_qwen.model.layers.rope import apply_rotary_emb
 
 
 class Qwen3Attention(nn.Module):
@@ -110,24 +110,24 @@ class Qwen3Attention(nn.Module):
             )                                          # [total, H_q, D]
             out = out.view(B, S, self.num_heads * self.head_dim)
         else:
-            # decode：每条序列位置不同，不能用 fused_qkv_rope
-            # cos/sin: [B, D]（由 ForCausalLM 按各序列位置 index 后传入）
-            raw_q = self.q_proj(hidden_states).view(B, 1, self.num_heads,    self.head_dim)
-            raw_k = self.k_proj(hidden_states).view(B, 1, self.num_kv_heads, self.head_dim)
-            raw_v = self.v_proj(hidden_states).view(B, 1, self.num_kv_heads, self.head_dim)
-            raw_q = self.q_norm(raw_q)
-            raw_k = self.k_norm(raw_k)
-            # cos/sin [B, D] → [B, 1, 1, D] 广播到 head 维
-            cos_b = cos.unsqueeze(1).unsqueeze(1)
-            sin_b = sin.unsqueeze(1).unsqueeze(1)
-            q = raw_q * cos_b + rotate_half(raw_q) * sin_b   # [B, 1, H_q,  D]
-            k = raw_k * cos_b + rotate_half(raw_k) * sin_b   # [B, 1, H_kv, D]
-            v = raw_v                                          # [B, 1, H_kv, D]
-            # seq_info = seq_lens_new [B]，新 token 位置 = seq_lens_new - 1
-            positions = (seq_info - 1).to(torch.int32)
+            # decode: each sequence is at a different RoPE position.
+            # cos/sin: [B, D] pre-indexed by the caller to each seq's current position.
+            # We use fused_qkv_rope with positions=arange(B) so that token b
+            # looks up row b of the [B, D] cos/sin tables (= cos_cached[seq_pos_b]).
+            positions_fused = torch.arange(B, device=hidden_states.device, dtype=torch.int32)
+            q, k, v = fused_qkv_rope(
+                hidden_states,
+                self.q_proj.weight, self.k_proj.weight, self.v_proj.weight,
+                self.q_norm.weight, self.k_norm.weight,
+                cos, sin,
+                positions=positions_fused,
+            )
+            # q: [B, 1, H_q, D]  k/v: [B, 1, H_kv, D]
+            # seq_info = seq_lens_new [B]; new token is at position seq_lens_new - 1
+            write_positions = (seq_info - 1).to(torch.int32)
             write_kv_decode(
                 k.squeeze(1).contiguous(), v.squeeze(1).contiguous(),
-                k_cache, v_cache, block_table, positions,
+                k_cache, v_cache, block_table, write_positions,
             )
             out = paged_attn_decode(
                 q.squeeze(1).contiguous(), k_cache, v_cache, block_table, seq_info,
